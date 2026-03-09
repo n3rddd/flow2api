@@ -23,14 +23,24 @@ class TokenManager:
         """Sort projects in a stable order for round-robin selection."""
         return sorted(projects, key=lambda project: (project.id or 0, project.project_id))
 
-    def _build_project_name(self, pool_index: int) -> str:
-        """Build a project name for the pool."""
-        base_name = datetime.now().strftime("%b %d - %H:%M")
-        return f"{base_name} P{pool_index}"
+    def _normalize_project_name_base(self, project_name: Optional[str] = None) -> str:
+        """Normalize a project base name for pooled creation."""
+        raw_name = (project_name or "").strip()
+        if raw_name:
+            parts = raw_name.rsplit(" ", 1)
+            if len(parts) == 2 and parts[1].startswith("P") and parts[1][1:].isdigit():
+                return parts[0]
+            return raw_name
+        return datetime.now().strftime("%b %d - %H:%M")
 
-    async def _create_project_for_token(self, token: Token, pool_index: int) -> Project:
+    def _build_project_name(self, pool_index: int, base_name: Optional[str] = None) -> str:
+        """Build a project name for the pool."""
+        normalized_base = self._normalize_project_name_base(base_name)
+        return f"{normalized_base} P{pool_index}"
+
+    async def _create_project_for_token(self, token: Token, pool_index: int, base_name: Optional[str] = None) -> Project:
         """Create a new pooled project for a token and persist it."""
-        project_name = self._build_project_name(pool_index)
+        project_name = self._build_project_name(pool_index, base_name)
         project_id = await self.flow_client.create_project(token.st, project_name)
         debug_logger.log_info(
             f"[PROJECT] Created pooled project for token {token.id}: {project_name} ({project_id})"
@@ -99,28 +109,11 @@ class TokenManager:
         video_concurrency: int = -1,
         captcha_proxy_url: Optional[str] = None
     ) -> Token:
-        """Add a new token
-
-        Args:
-            st: Session Token (必需)
-            project_id: 项目ID (可选,如果提供则直接使用,不创建新项目)
-            project_name: 项目名称 (可选,如果不提供则自动生成)
-            remark: 备注
-            image_enabled: 是否启用图片生成
-            video_enabled: 是否启用视频生成
-            image_concurrency: 图片并发限制
-            video_concurrency: 视频并发限制
-            captcha_proxy_url: token级浏览器打码代理（可选，优先于全局）
-
-        Returns:
-            Token object
-        """
-        # Step 1: 检查ST是否已存在
+        """Add a new token and prepare its pooled projects."""
         existing_token = await self.db.get_token_by_st(st)
         if existing_token:
-            raise ValueError(f"Token 已存在（邮箱: {existing_token.email}）")
+            raise ValueError(f"Token ??????: {existing_token.email}?")
 
-        # Step 2: 使用ST转换AT
         debug_logger.log_info(f"[ADD_TOKEN] Converting ST to AT...")
         try:
             result = await self.flow_client.st_to_at(st)
@@ -129,49 +122,49 @@ class TokenManager:
             user_info = result.get("user", {})
             email = user_info.get("email", "")
             name = user_info.get("name", email.split("@")[0] if email else "")
-
-            # 解析过期时间
             at_expires = None
             if expires:
                 try:
                     at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
-                except:
+                except Exception:
                     pass
-
         except Exception as e:
-            raise ValueError(f"ST转AT失败: {str(e)}")
+            raise ValueError(f"ST?AT??: {str(e)}")
 
-        # Step 3: 查询余额
         try:
             credits_result = await self.flow_client.get_credits(at)
             credits = credits_result.get("credits", 0)
             user_paygate_tier = credits_result.get("userPaygateTier")
-        except:
+        except Exception:
             credits = 0
             user_paygate_tier = None
 
-        # Step 4: 处理Project ID和名称
+        base_project_name = self._normalize_project_name_base(project_name)
+        pooled_projects: List[Project] = []
+
         if project_id:
-            # 用户提供了project_id,直接使用
-            debug_logger.log_info(f"[ADD_TOKEN] Using provided project_id: {project_id}")
-            if not project_name:
-                # 如果没有提供project_name,生成一个
-                now = datetime.now()
-                project_name = now.strftime("%b %d - %H:%M")
+            first_project_name = self._build_project_name(1, base_project_name)
+            debug_logger.log_info(f"[ADD_TOKEN] Using provided project_id as pooled project #1: {project_id}")
+            pooled_projects.append(Project(
+                project_id=project_id,
+                token_id=0,
+                project_name=first_project_name,
+                tool_name="PINHOLE"
+            ))
         else:
-            # 用户没有提供project_id,需要创建新项目
-            if not project_name:
-                # 自动生成项目名称
-                now = datetime.now()
-                project_name = now.strftime("%b %d - %H:%M")
-
             try:
-                project_id = await self.flow_client.create_project(st, project_name)
-                debug_logger.log_info(f"[ADD_TOKEN] Created new project: {project_name} (ID: {project_id})")
+                first_project_name = self._build_project_name(1, base_project_name)
+                first_project_id = await self.flow_client.create_project(st, first_project_name)
+                debug_logger.log_info(f"[ADD_TOKEN] Created pooled project #1: {first_project_name} (ID: {first_project_id})")
+                pooled_projects.append(Project(
+                    project_id=first_project_id,
+                    token_id=0,
+                    project_name=first_project_name,
+                    tool_name="PINHOLE"
+                ))
             except Exception as e:
-                raise ValueError(f"创建项目失败: {str(e)}")
+                raise ValueError(f"??????: {str(e)}")
 
-        # Step 5: 创建Token对象
         token = Token(
             st=st,
             at=at,
@@ -182,8 +175,8 @@ class TokenManager:
             is_active=True,
             credits=credits,
             user_paygate_tier=user_paygate_tier,
-            current_project_id=project_id,
-            current_project_name=project_name,
+            current_project_id=pooled_projects[0].project_id,
+            current_project_name=pooled_projects[0].project_name,
             image_enabled=image_enabled,
             video_enabled=video_enabled,
             image_concurrency=image_concurrency,
@@ -191,22 +184,20 @@ class TokenManager:
             captcha_proxy_url=captcha_proxy_url
         )
 
-        # Step 6: 保存到数据库
         token_id = await self.db.add_token(token)
         token.id = token_id
 
-        # Step 7: 保存Project到数据库
-        project = Project(
-            project_id=project_id,
-            token_id=token_id,
-            project_name=project_name,
-            tool_name="PINHOLE"
+        pooled_projects[0].token_id = token_id
+        pooled_projects[0].id = await self.db.add_project(pooled_projects[0])
+
+        while len(pooled_projects) < self._project_pool_size:
+            new_project = await self._create_project_for_token(token, len(pooled_projects) + 1, base_project_name)
+            pooled_projects.append(new_project)
+
+        debug_logger.log_info(
+            f"[ADD_TOKEN] Token added successfully (ID: {token_id}, Email: {email}, pooled_projects={len(pooled_projects)})"
         )
-        await self.db.add_project(project)
-
-        debug_logger.log_info(f"[ADD_TOKEN] Token added successfully (ID: {token_id}, Email: {email})")
         return token
-
     async def update_token(
         self,
         token_id: int,
