@@ -17,7 +17,7 @@ class TokenManager:
         self.flow_client = flow_client
         self._lock = asyncio.Lock()
         self._project_lock = asyncio.Lock()
-        self._project_pool_size = 2
+        self._project_pool_size = 4
 
     def _sort_projects(self, projects: List[Project]) -> List[Project]:
         """Sort projects in a stable order for round-robin selection."""
